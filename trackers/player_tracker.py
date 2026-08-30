@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 import supervision as sv
-import sys 
+import sys # helps in going back to directory
 sys.path.append('../')
 from utils import read_stub, save_stub
 
