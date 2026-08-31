@@ -1,5 +1,5 @@
 *.avi
-*.yolov8l.pt
+*.pt
 *models
 *.pkl
 *__pycache__
