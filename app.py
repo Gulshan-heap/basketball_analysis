@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import streamlit as st
 import pandas as pd
+import torch
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -269,13 +270,93 @@ def kpi(label, value, sub="", colour="gray"):
     </div>"""
 
 
+MODEL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "basketball_analysis_models")
+
+
+def get_device():
+    """Auto-detect the best available compute device."""
+    if torch.cuda.is_available():
+        return "cuda", torch.cuda.get_device_name(0)
+    return "cpu", "CPU"
+
+
+def materialize_uploaded_model(uploaded_file, cache_key):
+    """
+    Persist an uploaded .pt file to disk once, reusing the same path on
+    reruns (Streamlit reruns the script on every interaction, so we cache
+    by content hash + filename to avoid re-writing every time).
+    """
+    if uploaded_file is None:
+        return None
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+    dest = os.path.join(MODEL_CACHE_DIR, f"{cache_key}_{uploaded_file.name}")
+    if not os.path.exists(dest) or os.path.getsize(dest) != uploaded_file.size:
+        with open(dest, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+    return dest
+
+
+DEFAULT_DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1DSCBXDLWknTBo3xTRtUIwdkvgpZ9X9F1?usp=sharing"
+DRIVE_CACHE_DIR = os.path.join(MODEL_CACHE_DIR, "drive")
+
+
+def download_models_from_drive(folder_url, dest_dir=DRIVE_CACHE_DIR, force=False):
+    """
+    Downloads every file in a public Google Drive folder into dest_dir using
+    gdown, then returns the list of .pt files found there.
+
+    Skips the download entirely if .pt files already exist in dest_dir and
+    force=False, so re-running the app doesn't re-download every time.
+    """
+    import gdown
+
+    os.makedirs(dest_dir, exist_ok=True)
+    existing = list(Path(dest_dir).rglob("*.pt"))
+    if existing and not force:
+        return existing
+
+    gdown.download_folder(url=folder_url, output=dest_dir, quiet=True, use_cookies=False)
+    return list(Path(dest_dir).rglob("*.pt"))
+
+
+def guess_model_role(filename):
+    """Best-effort keyword match to figure out which model a file is."""
+    name = filename.lower()
+    if "player" in name:
+        return "player"
+    if "ball" in name:
+        return "ball"
+    if "court" in name or "keypoint" in name or "key_point" in name or "pitch" in name:
+        return "court"
+    return None
+
+
+def match_model_files(pt_files):
+    """Map downloaded .pt files to {'player': path, 'ball': path, 'court': path}."""
+    mapping = {"player": None, "ball": None, "court": None}
+    used = set()
+    for f in pt_files:
+        role = guess_model_role(f.name)
+        if role and mapping[role] is None:
+            mapping[role] = f
+            used.add(f)
+
+    # Fill any unmatched roles with leftover files, in order, as a fallback.
+    leftovers = [f for f in pt_files if f not in used]
+    for role in ["player", "ball", "court"]:
+        if mapping[role] is None and leftovers:
+            mapping[role] = leftovers.pop(0)
+
+    return mapping
+
+
 def check_models(player_model, ball_model, court_model):
     missing = []
     for label, path in [("Player detector", player_model),
                         ("Ball detector", ball_model),
                         ("Court keypoint detector", court_model)]:
-        if not Path(path).exists():
-            missing.append(f"**{label}**: `{path}`")
+        if not path or not Path(path).exists():
+            missing.append(f"**{label}**")
     return missing
 
 
@@ -362,6 +443,8 @@ def compute_stats(ball_aquisition, player_assignment, passes, interceptions,
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
+DEVICE, DEVICE_NAME = get_device()
+
 with st.sidebar:
     st.markdown("""
     <div style="text-align:center;padding:1.2rem 0 0.5rem;">
@@ -370,22 +453,109 @@ with st.sidebar:
         <div style="color:#8b949e;font-size:0.72rem;margin-top:0.1rem;">Analysis Pipeline</div>
     </div>
     """, unsafe_allow_html=True)
-    st.markdown("<hr style='border-color:#21262d;margin:0.8rem 0;'>", unsafe_allow_html=True)
 
-    with st.expander("🤖 Model Paths", expanded=True):
-        player_model = st.text_input("Player Detector", value="models/player_detector.pt",
-                                     label_visibility="visible")
-        ball_model   = st.text_input("Ball Detector",   value="models/ball_detector_model.pt")
-        court_model  = st.text_input("Court Keypoints", value="models/court_keypoint_detector.pt")
+    # ── device badge — always auto-detected, never manual ──────────────
+    device_icon  = "🟢" if DEVICE == "cuda" else "🖥️"
+    device_label = "GPU (CUDA)" if DEVICE == "cuda" else "CPU"
+    device_color = "#3fb950" if DEVICE == "cuda" else "#8b949e"
+    st.markdown(f"""
+    <div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;
+                padding:0.6rem 0.9rem;margin-bottom:0.8rem;text-align:center;">
+        <div style="color:{device_color};font-size:0.8rem;font-weight:700;">
+            {device_icon} {device_label}
+        </div>
+        <div style="color:#484f58;font-size:0.68rem;margin-top:0.15rem;">{DEVICE_NAME}</div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:#21262d;margin:0.4rem 0 0.8rem;'>", unsafe_allow_html=True)
 
-    with st.expander("👕 Team Jersey Colors", expanded=True):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("<div style='color:#e94560;font-size:0.75rem;font-weight:700;margin-bottom:4px;'>TEAM 1</div>", unsafe_allow_html=True)
-            team1_color = st.text_input("T1", value="white shirt", label_visibility="collapsed")
-        with col_b:
-            st.markdown("<div style='color:#4a90e2;font-size:0.75rem;font-weight:700;margin-bottom:4px;'>TEAM 2</div>", unsafe_allow_html=True)
-            team2_color = st.text_input("T2", value="dark blue shirt", label_visibility="collapsed")
+    # ── model weights — fetched directly from Google Drive ──────────────
+    with st.expander("🤖 Model Weights", expanded=True):
+        source_mode = st.radio(
+            "Source",
+            ["Google Drive (recommended)", "Upload manually", "Local path (advanced)"],
+            label_visibility="collapsed",
+        )
+
+        player_model = ball_model = court_model = None
+
+        if source_mode.startswith("Google Drive"):
+            drive_url = st.text_input("Drive folder link", value=DEFAULT_DRIVE_FOLDER_URL)
+            colf1, colf2 = st.columns([2, 1])
+            with colf1:
+                fetch_clicked = st.button("⬇️ Fetch models", use_container_width=True)
+            with colf2:
+                force_refetch = st.checkbox("Force", value=False, help="Re-download even if cached")
+
+            if fetch_clicked:
+                with st.spinner("Downloading model weights from Google Drive…"):
+                    try:
+                        pt_files = download_models_from_drive(drive_url, force=force_refetch)
+                        if not pt_files:
+                            st.error("No .pt files found in that Drive folder.")
+                        else:
+                            st.session_state["drive_pt_files"] = [str(f) for f in pt_files]
+                            st.success(f"Fetched {len(pt_files)} model file(s).")
+                    except Exception as e:
+                        st.error(f"Download failed: {e}")
+
+            drive_files = st.session_state.get("drive_pt_files", [])
+            if not drive_files:
+                # auto-check cache on first load so a re-run doesn't need a click
+                cached = list(Path(DRIVE_CACHE_DIR).rglob("*.pt")) if os.path.exists(DRIVE_CACHE_DIR) else []
+                if cached:
+                    drive_files = [str(f) for f in cached]
+                    st.session_state["drive_pt_files"] = drive_files
+
+            if drive_files:
+                pt_paths = [Path(f) for f in drive_files]
+                guessed = match_model_files(pt_paths)
+                names = [str(f) for f in pt_paths]
+
+                def _idx(role, fallback):
+                    g = guessed.get(role)
+                    return names.index(str(g)) if g and str(g) in names else min(fallback, len(names) - 1)
+
+                st.caption("Auto-matched by filename — fix below if a guess looks wrong.")
+                player_model = st.selectbox("Player detector file", names, index=_idx("player", 0), key="sel_player")
+                ball_model   = st.selectbox("Ball detector file",   names, index=_idx("ball", 1),   key="sel_ball")
+                court_model  = st.selectbox("Court keypoint file",  names, index=_idx("court", 2),  key="sel_court")
+            else:
+                st.info("Click **Fetch models** to download the three `.pt` files from Drive.")
+
+        elif source_mode.startswith("Upload"):
+            player_upload = st.file_uploader("Player Detector (.pt)", type=["pt"], key="up_player")
+            ball_upload   = st.file_uploader("Ball Detector (.pt)",   type=["pt"], key="up_ball")
+            court_upload  = st.file_uploader("Court Keypoint Detector (.pt)", type=["pt"], key="up_court")
+            player_model = materialize_uploaded_model(player_upload, "player")
+            ball_model   = materialize_uploaded_model(ball_upload,   "ball")
+            court_model  = materialize_uploaded_model(court_upload,  "court")
+
+        else:  # Local path
+            player_model = st.text_input("Local player model path", value="") or None
+            ball_model   = st.text_input("Local ball model path", value="") or None
+            court_model  = st.text_input("Local court model path", value="") or None
+
+    # ── team color detection — automatic by default ─────────────────────
+    with st.expander("👕 Team Detection", expanded=True):
+        team_mode = st.radio(
+            "Mode",
+            ["Automatic (recommended)", "Manual (describe jersey colors)"],
+            label_visibility="collapsed",
+        )
+        if team_mode.startswith("Automatic"):
+            st.caption("Team colors are discovered directly from the video "
+                      "via color clustering — works with any jersey colors, "
+                      "no typing required.")
+            team1_color = team2_color = None
+        else:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("<div style='color:#e94560;font-size:0.75rem;font-weight:700;margin-bottom:4px;'>TEAM 1</div>", unsafe_allow_html=True)
+                team1_color = st.text_input("T1", value="white shirt", label_visibility="collapsed")
+            with col_b:
+                st.markdown("<div style='color:#4a90e2;font-size:0.75rem;font-weight:700;margin-bottom:4px;'>TEAM 2</div>", unsafe_allow_html=True)
+                team2_color = st.text_input("T2", value="dark blue shirt", label_visibility="collapsed")
 
     with st.expander("⚙️ Processing", expanded=False):
         use_stubs  = st.checkbox("Use cached stubs (faster)", value=True)
@@ -480,18 +650,20 @@ if video_path:
 
     left, right = st.columns([1, 3])
     with left:
-        run_analysis = st.button("🚀  Run Analysis", type="primary", use_container_width=True)
+        run_analysis = st.button("🚀  Run Analysis", type="primary",
+                                 use_container_width=True, disabled=bool(missing_models))
     with right:
         if missing_models:
-            st.warning("⚠️ Missing models:\n" + "\n".join(missing_models))
+            st.warning("⚠️ Upload all three model weight files in the sidebar first — missing: "
+                      + ", ".join(missing_models))
         else:
-            st.success("✅ All models found — ready to analyse")
+            st.success(f"✅ All models loaded — running on **{DEVICE_NAME}**, ready to analyse")
 
     if run_analysis:
         try:
             from utils import read_video, save_video
             from trackers import PlayerTracker, BallTracker
-            from team_assigner import TeamAssigner
+            from team_assigner import TeamAssigner, AutoTeamAssigner
             from court_keypoint_detector import CourtKeypointDetector
             from ball_aquisition import BallAquisitionDetector
             from pass_and_interception_detector import PassAndInterceptionDetector
@@ -520,10 +692,10 @@ if video_path:
         video_frames = read_video(video_path)
         total_frames = len(video_frames)
 
-        upd(10, "🔍 Initialising detectors…")
-        player_tracker = PlayerTracker(player_model)
-        ball_tracker   = BallTracker(ball_model)
-        court_kp_det   = CourtKeypointDetector(court_model)
+        upd(10, f"🔍 Initialising detectors on {DEVICE_NAME}…")
+        player_tracker = PlayerTracker(player_model, device=DEVICE)
+        ball_tracker   = BallTracker(ball_model, device=DEVICE)
+        court_kp_det   = CourtKeypointDetector(court_model, device=DEVICE)
         os.makedirs(stub_dir, exist_ok=True)
 
         upd(15, "🏃 Tracking players…")
@@ -545,11 +717,36 @@ if video_path:
         ball_tracks = ball_tracker.remove_wrong_detections(ball_tracks)
         ball_tracks = ball_tracker.interpolate_ball_positions(ball_tracks)
 
-        upd(48, "👕 Assigning teams…")
-        team_assigner = TeamAssigner(team_1_class_name=team1_color, team_2_class_name=team2_color)
-        player_assignment = team_assigner.get_player_teams_across_frames(
-            video_frames, player_tracks, read_from_stub=use_stubs,
-            stub_path=os.path.join(stub_dir, "player_assignment_stub.pkl"))
+        if team_mode.startswith("Automatic"):
+            upd(48, "👕 Discovering team colors automatically…")
+            team_assigner = AutoTeamAssigner()
+            player_assignment = team_assigner.get_player_teams_across_frames(
+                video_frames, player_tracks, read_from_stub=use_stubs,
+                stub_path=os.path.join(stub_dir, "auto_player_assignment_stub.pkl"))
+
+            color_preview = team_assigner.get_team_color_preview()
+            if color_preview:
+                r1, g1, b1 = color_preview[1]
+                r2, g2, b2 = color_preview[2]
+                st.markdown(f"""
+                <div style="display:flex;gap:1rem;margin:0.5rem 0;">
+                    <div style="display:flex;align-items:center;gap:0.4rem;">
+                        <div style="width:16px;height:16px;border-radius:4px;background:rgb({r1},{g1},{b1});border:1px solid #30363d;"></div>
+                        <span style="color:#8b949e;font-size:0.8rem;">Team 1 detected color</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:0.4rem;">
+                        <div style="width:16px;height:16px;border-radius:4px;background:rgb({r2},{g2},{b2});border:1px solid #30363d;"></div>
+                        <span style="color:#8b949e;font-size:0.8rem;">Team 2 detected color</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            upd(48, "👕 Assigning teams from jersey descriptions…")
+            team_assigner = TeamAssigner(
+                team_1_class_name=team1_color, team_2_class_name=team2_color, device=DEVICE)
+            player_assignment = team_assigner.get_player_teams_across_frames(
+                video_frames, player_tracks, read_from_stub=use_stubs,
+                stub_path=os.path.join(stub_dir, "player_assignment_stub.pkl"))
 
         upd(55, "🤝 Detecting ball possession…")
         ball_acq_det  = BallAquisitionDetector()
