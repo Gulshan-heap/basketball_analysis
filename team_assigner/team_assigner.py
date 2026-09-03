@@ -1,5 +1,6 @@
 from PIL import Image
 import cv2
+import torch
 from transformers import CLIPProcessor, CLIPModel
 
 import sys 
@@ -22,6 +23,7 @@ class TeamAssigner:
     def __init__(self,
                  team_1_class_name= "white shirt",
                  team_2_class_name= "dark blue shirt",
+                 device=None,
                  ):
         """
         Initialize the TeamAssigner with specified team jersey descriptions.
@@ -29,18 +31,20 @@ class TeamAssigner:
         Args:
             team_1_class_name (str): Description of Team 1's jersey appearance.
             team_2_class_name (str): Description of Team 2's jersey appearance.
+            device (str, optional): 'cuda' or 'cpu'. Auto-detected if not given.
         """
         self.team_colors = {}
         self.player_team_dict = {}        
     
         self.team_1_class_name = team_1_class_name
         self.team_2_class_name = team_2_class_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     def load_model(self):
         """
         Loads the pre-trained vision model for jersey color classification.
         """
-        self.model = CLIPModel.from_pretrained("patrickjohncyh/fashion-clip")
+        self.model = CLIPModel.from_pretrained("patrickjohncyh/fashion-clip").to(self.device)
         self.processor = CLIPProcessor.from_pretrained("patrickjohncyh/fashion-clip")
 
     def get_player_color(self,frame,bbox):
@@ -64,6 +68,7 @@ class TeamAssigner:
         classes = [self.team_1_class_name, self.team_2_class_name]
 
         inputs = self.processor(text=classes, images=image, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         outputs = self.model(**inputs)
         logits_per_image = outputs.logits_per_image

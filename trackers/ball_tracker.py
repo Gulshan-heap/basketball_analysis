@@ -2,6 +2,7 @@ from ultralytics import YOLO
 import supervision as sv
 import numpy as np
 import pandas as pd
+import torch
 import sys 
 sys.path.append('../')
 from utils import read_stub, save_stub
@@ -14,8 +15,10 @@ class BallTracker:
     This class provides methods to detect the ball in video frames, process detections
     in batches, and refine tracking results through filtering and interpolation.
     """
-    def __init__(self, model_path):
-        self.model = YOLO(model_path) 
+    def __init__(self, model_path, device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = YOLO(model_path)
+        self.model.to(self.device)
 
     def detect_frames(self, frames):
         """
@@ -30,7 +33,8 @@ class BallTracker:
         batch_size=20 
         detections = [] 
         for i in range(0,len(frames),batch_size):
-            detections_batch = self.model.predict(frames[i:i+batch_size],conf=0.5)
+            detections_batch = self.model.predict(
+                frames[i:i+batch_size], conf=0.5, device=self.device, verbose=False)
             detections += detections_batch
         return detections
 
