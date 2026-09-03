@@ -280,22 +280,6 @@ def get_device():
     return "cpu", "CPU"
 
 
-def materialize_uploaded_model(uploaded_file, cache_key):
-    """
-    Persist an uploaded .pt file to disk once, reusing the same path on
-    reruns (Streamlit reruns the script on every interaction, so we cache
-    by content hash + filename to avoid re-writing every time).
-    """
-    if uploaded_file is None:
-        return None
-    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
-    dest = os.path.join(MODEL_CACHE_DIR, f"{cache_key}_{uploaded_file.name}")
-    if not os.path.exists(dest) or os.path.getsize(dest) != uploaded_file.size:
-        with open(dest, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-    return dest
-
-
 DEFAULT_DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1DSCBXDLWknTBo3xTRtUIwdkvgpZ9X9F1?usp=sharing"
 DRIVE_CACHE_DIR = os.path.join(MODEL_CACHE_DIR, "drive")
 
@@ -348,6 +332,30 @@ def match_model_files(pt_files):
             mapping[role] = leftovers.pop(0)
 
     return mapping
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_models_ready():
+    """
+    Guarantees the three trained model weights are present on disk and
+    returns their paths, fetching them from the configured Google Drive
+    folder exactly once per running app (cached both in-memory for the
+    process, via st.cache_resource, and on-disk under DRIVE_CACHE_DIR so a
+    restart doesn't re-download either). No UI, no URL, no manual step.
+    """
+    try:
+        pt_files = download_models_from_drive(DEFAULT_DRIVE_FOLDER_URL)
+    except Exception:
+        return None, None, None
+
+    if not pt_files:
+        return None, None, None
+
+    mapping = match_model_files(pt_files)
+    player = str(mapping["player"]) if mapping["player"] else None
+    ball   = str(mapping["ball"])   if mapping["ball"]   else None
+    court  = str(mapping["court"])  if mapping["court"]  else None
+    return player, ball, court
 
 
 def check_models(player_model, ball_model, court_model):
@@ -469,72 +477,26 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.markdown("<hr style='border-color:#21262d;margin:0.4rem 0 0.8rem;'>", unsafe_allow_html=True)
 
-    # ── model weights — fetched directly from Google Drive ──────────────
-    with st.expander("🤖 Model Weights", expanded=True):
-        source_mode = st.radio(
-            "Source",
-            ["Google Drive (recommended)", "Upload manually", "Local path (advanced)"],
-            label_visibility="collapsed",
-        )
+    # ── model weights — auto-fetched from Drive, silently, once ─────────
+    with st.spinner("Loading model weights…"):
+        player_model, ball_model, court_model = ensure_models_ready()
 
-        player_model = ball_model = court_model = None
-
-        if source_mode.startswith("Google Drive"):
-            drive_url = st.text_input("Drive folder link", value=DEFAULT_DRIVE_FOLDER_URL)
-            colf1, colf2 = st.columns([2, 1])
-            with colf1:
-                fetch_clicked = st.button("⬇️ Fetch models", use_container_width=True)
-            with colf2:
-                force_refetch = st.checkbox("Force", value=False, help="Re-download even if cached")
-
-            if fetch_clicked:
-                with st.spinner("Downloading model weights from Google Drive…"):
-                    try:
-                        pt_files = download_models_from_drive(drive_url, force=force_refetch)
-                        if not pt_files:
-                            st.error("No .pt files found in that Drive folder.")
-                        else:
-                            st.session_state["drive_pt_files"] = [str(f) for f in pt_files]
-                            st.success(f"Fetched {len(pt_files)} model file(s).")
-                    except Exception as e:
-                        st.error(f"Download failed: {e}")
-
-            drive_files = st.session_state.get("drive_pt_files", [])
-            if not drive_files:
-                # auto-check cache on first load so a re-run doesn't need a click
-                cached = list(Path(DRIVE_CACHE_DIR).rglob("*.pt")) if os.path.exists(DRIVE_CACHE_DIR) else []
-                if cached:
-                    drive_files = [str(f) for f in cached]
-                    st.session_state["drive_pt_files"] = drive_files
-
-            if drive_files:
-                pt_paths = [Path(f) for f in drive_files]
-                guessed = match_model_files(pt_paths)
-                names = [str(f) for f in pt_paths]
-
-                def _idx(role, fallback):
-                    g = guessed.get(role)
-                    return names.index(str(g)) if g and str(g) in names else min(fallback, len(names) - 1)
-
-                st.caption("Auto-matched by filename — fix below if a guess looks wrong.")
-                player_model = st.selectbox("Player detector file", names, index=_idx("player", 0), key="sel_player")
-                ball_model   = st.selectbox("Ball detector file",   names, index=_idx("ball", 1),   key="sel_ball")
-                court_model  = st.selectbox("Court keypoint file",  names, index=_idx("court", 2),  key="sel_court")
-            else:
-                st.info("Click **Fetch models** to download the three `.pt` files from Drive.")
-
-        elif source_mode.startswith("Upload"):
-            player_upload = st.file_uploader("Player Detector (.pt)", type=["pt"], key="up_player")
-            ball_upload   = st.file_uploader("Ball Detector (.pt)",   type=["pt"], key="up_ball")
-            court_upload  = st.file_uploader("Court Keypoint Detector (.pt)", type=["pt"], key="up_court")
-            player_model = materialize_uploaded_model(player_upload, "player")
-            ball_model   = materialize_uploaded_model(ball_upload,   "ball")
-            court_model  = materialize_uploaded_model(court_upload,  "court")
-
-        else:  # Local path
-            player_model = st.text_input("Local player model path", value="") or None
-            ball_model   = st.text_input("Local ball model path", value="") or None
-            court_model  = st.text_input("Local court model path", value="") or None
+    if player_model and ball_model and court_model:
+        st.markdown("""
+        <div style="background:#0d1117;border:1px solid #21262d;border-radius:8px;
+                    padding:0.6rem 0.9rem;margin-bottom:0.8rem;display:flex;
+                    align-items:center;gap:0.5rem;">
+            <span style="color:#3fb950;font-size:0.9rem;">✅</span>
+            <span style="color:#8b949e;font-size:0.78rem;">Models loaded and ready</span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="background:#0d1117;border:1px solid #f85149;border-radius:8px;
+                    padding:0.6rem 0.9rem;margin-bottom:0.8rem;">
+            <span style="color:#f85149;font-size:0.8rem;font-weight:600;">⚠️ Models unavailable</span>
+        </div>
+        """, unsafe_allow_html=True)
 
     # ── team color detection — automatic by default ─────────────────────
     with st.expander("👕 Team Detection", expanded=True):
@@ -600,45 +562,28 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 # VIDEO INPUT
 # ─────────────────────────────────────────────────────────────────────────────
-tab_upload, tab_sample = st.tabs(["📁  Upload Video", "🎬  Sample Video"])
+sec("📁", "Upload Video")
 
 video_path = None
-with tab_upload:
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-    uploaded = st.file_uploader(
-        "Drop a basketball video here",
-        type=["mp4", "avi", "mov", "mkv"],
-        label_visibility="collapsed",
-    )
-    if not uploaded:
-        st.markdown("""
-        <div class="upload-zone">
-            <div style="font-size:2.5rem;margin-bottom:0.6rem;">📹</div>
-            <div style="color:#e6edf3;font-weight:600;font-size:1rem;">Drop your video here</div>
-            <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem;">MP4 · AVI · MOV · MKV</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tmp.write(uploaded.read())
-        tmp.close()
-        video_path = tmp.name
-        st.video(video_path)
-
-with tab_sample:
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-    sample_dir = "input_videos"
-    samples = ([f for f in os.listdir(sample_dir) if f.endswith((".mp4", ".avi", ".mov"))]
-               if os.path.exists(sample_dir) else [])
-    if samples:
-        chosen = st.selectbox("Choose a sample video", samples, label_visibility="collapsed")
-        if st.button("▶ Load this sample", use_container_width=True):
-            st.session_state["video_path"] = os.path.join(sample_dir, chosen)
-        if "video_path" in st.session_state and not uploaded:
-            video_path = st.session_state["video_path"]
-            st.video(video_path)
-    else:
-        st.info("No sample videos found in `input_videos/` — add `.mp4` files there.")
+uploaded = st.file_uploader(
+    "Drop a basketball video here",
+    type=["mp4", "avi", "mov", "mkv"],
+    label_visibility="collapsed",
+)
+if not uploaded:
+    st.markdown("""
+    <div class="upload-zone">
+        <div style="font-size:2.5rem;margin-bottom:0.6rem;">📹</div>
+        <div style="color:#e6edf3;font-weight:600;font-size:1rem;">Drop your video here</div>
+        <div style="color:#8b949e;font-size:0.8rem;margin-top:0.3rem;">MP4 · AVI · MOV · MKV</div>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp.write(uploaded.read())
+    tmp.close()
+    video_path = tmp.name
+    st.video(video_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -654,8 +599,8 @@ if video_path:
                                  use_container_width=True, disabled=bool(missing_models))
     with right:
         if missing_models:
-            st.warning("⚠️ Upload all three model weight files in the sidebar first — missing: "
-                      + ", ".join(missing_models))
+            st.warning("⚠️ Model weights could not be loaded automatically. "
+                      "Please check your connection and reload the app.")
         else:
             st.success(f"✅ All models loaded — running on **{DEVICE_NAME}**, ready to analyse")
 
@@ -1084,9 +1029,9 @@ else:
     sec("🚀", "Getting Started")
     st.markdown("""
     <div style="background:#0d1117;border:1px solid #21262d;border-radius:12px;padding:1.5rem 2rem;color:#8b949e;line-height:2;">
-        <span style="color:#e6edf3;font-weight:700;">1.</span> Upload a basketball video using the tab above<br>
-        <span style="color:#e6edf3;font-weight:700;">2.</span> Verify model paths in the sidebar match your <code style="background:#161b22;padding:2px 6px;border-radius:4px;">.pt</code> files<br>
-        <span style="color:#e6edf3;font-weight:700;">3.</span> Adjust team jersey descriptions if needed<br>
+        <span style="color:#e6edf3;font-weight:700;">1.</span> Upload a basketball video above<br>
+        <span style="color:#e6edf3;font-weight:700;">2.</span> Model weights load automatically — nothing to configure<br>
+        <span style="color:#e6edf3;font-weight:700;">3.</span> Team colors are detected automatically from the footage<br>
         <span style="color:#e6edf3;font-weight:700;">4.</span> Hit <strong style="color:#e94560;">Run Analysis</strong> and wait for the pipeline to finish<br>
         <span style="color:#e6edf3;font-weight:700;">5.</span> Explore the annotated video, stats charts, and frame explorer
     </div>
